@@ -43,9 +43,9 @@ Open with **right-click → Open** the first time if Gatekeeper prompts.
 1. **Choose** source folder and output folder.
 2. Pick **media profile** (25 / 50 / 100 / 128 GB class) — sizes are **safe payload** limits, not marketing capacity.
 3. Set **TAR first** (recommended for reliability) and **PAR2** toggle.
-4. If PAR2 is enabled, adjust **PAR2 redundancy** (default 12%). With TAR off, PAR2 creates one set per top-level source item.
+4. If PAR2 is enabled, adjust **PAR2 redundancy** (default 12%). With TAR off, the source is copied to staging and PAR2 creates one set per top-level source item (`par2 create -R -B <disc root>`), stored with a per-file `SHA256SUMS.txt` and a `README.txt` in `_BluArchive/` on the disc. Empty items (no non-empty files) get no PAR2 set but are covered by the SHA-256 manifest.
 5. Optionally **burn**; pick drive or enter **BSD device** (e.g. `disk4`).
-6. Choose **verify** mode; **quick** checks staging TAR checksum, and **deep** also checks burned media checksum (no `hdiutil verify` gate).
+6. Choose **verify** mode. TAR on: **quick** checks the staging TAR checksum, **deep** also checks the burned media checksum (no `hdiutil verify` gate). TAR off: **quick** checks every file's SHA-256 in staging and inside the read-only mounted ISO plus `par2 verify` of every set in the ISO; **deep** also runs both checks on the burned disc. The log ends with a per-level summary; levels not checked are reported as NOT VERIFIED.
 7. **Export diagnostics** saves settings + full log.
 
 ## Runbook / test matrix

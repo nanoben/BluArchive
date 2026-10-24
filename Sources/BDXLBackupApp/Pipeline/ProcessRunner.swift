@@ -186,6 +186,10 @@ enum ToolResolver {
         )
     }
 
+    static func dittoExecutable() -> String {
+        "/usr/bin/ditto"
+    }
+
     static func drutilExecutable() -> String {
         "/usr/bin/drutil"
     }

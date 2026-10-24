@@ -22,8 +22,10 @@ if [[ ! -f "$BIN_ARM64" || ! -f "$BIN_X64" ]]; then
   exit 1
 fi
 
-APP_NAME="BluArchive"
-OUT_DIR="$ROOT/build"
+# Overridable so a side-by-side build (e.g. "BluArchive Fixed") does not replace the original app.
+APP_NAME="${APP_NAME:-BluArchive}"
+OUT_DIR="${OUT_DIR:-$ROOT/build}"
+BUNDLE_ID="${BUNDLE_ID:-local.bdxl.BDXLBackupApp}"
 BUNDLE="$OUT_DIR/${APP_NAME}.app"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS"
@@ -68,7 +70,7 @@ cat > "$PLIST" <<EOF
   <key>CFBundleExecutable</key>
   <string>BDXLBackupApp</string>
   <key>CFBundleIdentifier</key>
-  <string>local.bdxl.BDXLBackupApp</string>
+  <string>${BUNDLE_ID}</string>
   <key>CFBundleName</key>
   <string>${APP_NAME}</string>
   <key>CFBundleDisplayName</key>
@@ -90,6 +92,9 @@ cat > "$PLIST" <<EOF
 </dict>
 </plist>
 EOF
+
+# Ad hoc signature (local use only) so the universal binary launches on Apple Silicon.
+codesign --force --deep --sign - "$BUNDLE"
 
 echo "Created: $BUNDLE"
 lipo -info "$BUNDLE/Contents/MacOS/BDXLBackupApp"

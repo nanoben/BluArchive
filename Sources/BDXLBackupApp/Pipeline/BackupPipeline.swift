@@ -42,16 +42,37 @@ final class BackupPipeline: ObservableObject {
                 state.appendLog("Skipping burn (generate ISO only).")
             }
 
+            var verificationSummary: [String] = []
             if settings.verifyMode != .none {
                 try Task.checkCancellation()
                 state.stage = .verify
                 state.progress = 0.92
-                try await verifyArtifacts(
-                    settings: settings,
-                    state: state,
-                    workURL: paths.workURL,
-                    tarBaseName: paths.tarBaseName
-                )
+                if let discRoot = paths.discRootURL {
+                    verificationSummary = try await verifyNonTarArtifacts(
+                        settings: settings,
+                        state: state,
+                        discRoot: discRoot,
+                        isoURL: paths.isoURL,
+                        expectedPar2Sets: paths.par2SetCount
+                    )
+                } else {
+                    try await verifyArtifacts(
+                        settings: settings,
+                        state: state,
+                        workURL: paths.workURL,
+                        tarBaseName: paths.tarBaseName
+                    )
+                }
+            } else if !settings.tarFirstEnabled {
+                verificationSummary = [
+                    "Staging: NOT VERIFIED (Verify = None)",
+                    "ISO image: NOT VERIFIED (Verify = None)",
+                    "Burned disc: NOT VERIFIED (Verify = None)"
+                ]
+            }
+            if !verificationSummary.isEmpty {
+                state.appendLog("Verification summary:")
+                verificationSummary.forEach { state.appendLog("  • \($0)") }
             }
 
             if !settings.keepStagingFiles {
@@ -81,7 +102,13 @@ final class BackupPipeline: ObservableObject {
         let isoURL: URL
         let tarBaseName: String
         let manifestURL: URL?
+        let discRootURL: URL?
+        let par2SetCount: Int
     }
+
+    /// Disc-root folder (non-TAR mode) holding the SHA-256 manifest, PAR2 sets and a README.
+    static let archiveMetaFolderName = "_BluArchive"
+    static let discManifestName = "SHA256SUMS.txt"
 
     private func preflight(settings: BackupJobSettings, state: BackupState) async throws {
         guard let source = settings.sourceFolder else {
@@ -98,7 +125,32 @@ final class BackupPipeline: ObservableObject {
             throw NSError(domain: "BDXLBackup", code: 4, userInfo: [NSLocalizedDescriptionKey: "Output is not a directory."])
         }
 
-        if settings.tarFirstEnabled && settings.par2Enabled {
+        let sourcePath = source.standardizedFileURL.resolvingSymlinksInPath().path
+        let outputPath = output.standardizedFileURL.resolvingSymlinksInPath().path
+        guard sourcePath != outputPath, !outputPath.hasPrefix(sourcePath + "/") else {
+            throw NSError(
+                domain: "BDXLBackup",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "Output folder must be outside the source folder (originals are never written to)."]
+            )
+        }
+        guard !sourcePath.hasPrefix(outputPath + "/_bdxl_work") else {
+            throw NSError(
+                domain: "BDXLBackup",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "Source folder lies inside the staging folder (_bdxl_work), which is deleted on each run."]
+            )
+        }
+        if !settings.tarFirstEnabled,
+           FileManager.default.fileExists(atPath: source.appendingPathComponent(Self.archiveMetaFolderName).path) {
+            throw NSError(
+                domain: "BDXLBackup",
+                code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "Source already contains a top-level '\(Self.archiveMetaFolderName)' item; it is reserved for checksums and PAR2 files on the disc."]
+            )
+        }
+
+        if settings.par2Enabled {
             if let par2 = await ToolResolver.par2Executable() {
                 state.appendLog("Found par2 at: \(par2)")
             } else {
@@ -119,7 +171,8 @@ final class BackupPipeline: ObservableObject {
         } else if settings.tarFirstEnabled {
             projectedFactor = 1.15
         } else {
-            projectedFactor = 1.08
+            /// Non-TAR: full staging copy + ISO + PAR2 sets.
+            projectedFactor = 2.05 + (settings.par2Enabled ? Double(settings.par2RedundancyPercent) / 100 : 0)
         }
         let projectedBytes = Int64(Double(sourceBytes) * projectedFactor) + 512 * 1024 * 1024
         guard projectedBytes < freeBytes else {
@@ -135,7 +188,11 @@ final class BackupPipeline: ObservableObject {
 
         let safeGiB = settings.profile.safeMaxPayloadGiB
         let maxBytes = Int64(safeGiB * 1024 * 1024 * 1024)
-        guard sourceBytes <= maxBytes else {
+        /// Non-TAR discs carry the PAR2 sets next to the files, so count them against the media limit.
+        let payloadBytes = settings.tarFirstEnabled || !settings.par2Enabled
+            ? sourceBytes
+            : Int64(Double(sourceBytes) * (1 + Double(settings.par2RedundancyPercent) / 100))
+        guard payloadBytes <= maxBytes else {
             throw NSError(
                 domain: "BDXLBackup",
                 code: 7,
@@ -182,6 +239,9 @@ final class BackupPipeline: ObservableObject {
 
         var effectiveTarURL: URL?
         var isoSourceURL: URL
+        /// Non-TAR only: staged copy of the source that becomes the disc root (originals + `_BluArchive/`).
+        var discRootURL: URL?
+        var par2SetCount = 0
 
         if settings.tarFirstEnabled {
             // TAR
@@ -199,7 +259,25 @@ final class BackupPipeline: ObservableObject {
             isoSourceURL = workURL
         } else {
             state.appendLog("Skipping TAR stage (TAR first disabled).")
-            isoSourceURL = source
+            // hdiutil makehybrid takes a single source folder, so the PAR2 sets and checksums can only
+            // reach the disc if they sit next to the files. Stage a copy; the originals are only read.
+            state.stage = .copy
+            state.progress = 0.1
+            let discRoot = workURL.appendingPathComponent("disc", isDirectory: true)
+            state.appendLog("Copying source into staging (originals are read-only): \(discRoot.path)")
+            let dittoArgs = ["--norsrc", "--noextattr", "--noqtn", "--noacl", source.path, discRoot.path]
+            let dittoCode = try await runner.runStreaming(
+                launchPath: ToolResolver.dittoExecutable(),
+                arguments: dittoArgs,
+                onLine: { state.appendLog($0) }
+            )
+            try throwIfBadExit(dittoCode, cmd: "ditto \(dittoArgs.joined(separator: " "))")
+            try FileManager.default.createDirectory(
+                at: discRoot.appendingPathComponent(Self.archiveMetaFolderName, isDirectory: true),
+                withIntermediateDirectories: true
+            )
+            discRootURL = discRoot
+            isoSourceURL = discRoot
         }
 
         // PAR2
@@ -218,17 +296,19 @@ final class BackupPipeline: ObservableObject {
                 onLine: { state.appendLog($0) }
             )
             try throwIfBadExit(par2Code, cmd: "par2 \(par2Args.joined(separator: " "))")
-        } else if settings.par2Enabled {
+        } else if settings.par2Enabled, let discRoot = discRootURL {
             state.stage = .par2
             state.progress = 0.35
             guard let par2 = await ToolResolver.par2Executable() else {
                 throw NSError(domain: "BDXLBackup", code: 9, userInfo: [NSLocalizedDescriptionKey: "par2 disappeared from PATH."])
             }
             let redundancy = max(1, min(32, settings.par2RedundancyPercent))
-            let par2OutputDir = workURL.appendingPathComponent("par2", isDirectory: true)
+            let par2OutputDir = discRoot
+                .appendingPathComponent(Self.archiveMetaFolderName, isDirectory: true)
+                .appendingPathComponent("par2", isDirectory: true)
             try FileManager.default.createDirectory(at: par2OutputDir, withIntermediateDirectories: true)
 
-            let items = try topLevelItemsForPar2(in: source)
+            let items = try topLevelItemsForPar2(in: discRoot)
             if items.isEmpty {
                 state.appendLog("PAR2 non-TAR mode: no eligible top-level items found; skipping PAR2 files.")
             } else {
@@ -236,9 +316,18 @@ final class BackupPipeline: ObservableObject {
             }
 
             for (index, item) in items.enumerated() {
+                try Task.checkCancellation()
+                // par2 rejects folders that hold no data ("You must specify a list of files"); such items
+                // are still on the disc and covered by the SHA-256 manifest.
+                guard containsNonEmptyRegularFile(item) else {
+                    state.appendLog("PAR2 skip for '\(item.lastPathComponent)': no non-empty files (covered by SHA-256 manifest only).")
+                    continue
+                }
                 let baseName = par2BaseName(for: item, index: index)
                 let par2BasePath = par2OutputDir.appendingPathComponent(baseName).path
-                let args = ["create", "-r\(redundancy)", par2BasePath, item.path]
+                // -R: recurse into folders. -B: store paths relative to the disc root, e.g. "1928/x.jpg",
+                // so the set verifies against the original folder structure on the disc.
+                let args = ["create", "-q", "-R", "-r\(redundancy)", "-B\(discRoot.path)", par2BasePath, item.path]
                 state.appendLog("PAR2 create for '\(item.lastPathComponent)'…")
                 let code = try await runner.runStreaming(
                     launchPath: par2,
@@ -246,7 +335,9 @@ final class BackupPipeline: ObservableObject {
                     onLine: { state.appendLog($0) }
                 )
                 try throwIfBadExit(code, cmd: "par2 \(args.joined(separator: " "))")
+                par2SetCount += 1
             }
+            state.appendLog("PAR2 non-TAR mode: \(par2SetCount) set(s) written to \(Self.archiveMetaFolderName)/par2 on the disc.")
         } else {
             state.appendLog("Skipping PAR2 stage (disabled).")
         }
@@ -265,10 +356,19 @@ final class BackupPipeline: ObservableObject {
             try throwIfBadExit(shaCode, cmd: "shasum")
             try shaOut.write(to: manifestURL, atomically: true, encoding: .utf8)
             effectiveManifestURL = manifestURL
-        } else {
-            let note = "TAR disabled; TAR checksum manifest not generated.\nSource folder: \(source.path)\n"
-            try note.write(to: manifestURL, atomically: true, encoding: .utf8)
-            state.appendLog("Skipping TAR checksum manifest (TAR first disabled).")
+        } else if let discRoot = discRootURL {
+            state.appendLog("Writing per-file SHA-256 manifest from the ORIGINAL files…")
+            let log = Self.logger(for: state)
+            let entries = try await Self.offMain {
+                try ChecksumManifest.build(root: source, onProgress: { log("  hashed \($0) original files…") })
+            }
+            let metaDir = discRoot.appendingPathComponent(Self.archiveMetaFolderName, isDirectory: true)
+            let discManifestURL = metaDir.appendingPathComponent(Self.discManifestName)
+            try ChecksumManifest.write(entries, to: discManifestURL)
+            try discReadme(settings: settings, sourceName: basename, par2SetCount: par2SetCount)
+                .write(to: metaDir.appendingPathComponent("README.txt"), atomically: true, encoding: .utf8)
+            state.appendLog("SHA-256 manifest: \(entries.count) file(s) → \(Self.archiveMetaFolderName)/\(Self.discManifestName)")
+            effectiveManifestURL = discManifestURL
         }
 
         // ISO
@@ -298,7 +398,9 @@ final class BackupPipeline: ObservableObject {
             tarURL: effectiveTarURL,
             isoURL: isoURL,
             tarBaseName: basename,
-            manifestURL: effectiveManifestURL
+            manifestURL: effectiveManifestURL,
+            discRootURL: discRootURL,
+            par2SetCount: par2SetCount
         )
     }
 
@@ -484,6 +586,213 @@ final class BackupPipeline: ObservableObject {
         return entries.first { $0.lastPathComponent.hasPrefix(expectedVolumeLabel) }
     }
 
+    /// Non-TAR verification. Each level is reported separately; any failed check throws, and levels
+    /// that were not checked are reported as NOT VERIFIED rather than silently passing.
+    private func verifyNonTarArtifacts(
+        settings: BackupJobSettings,
+        state: BackupState,
+        discRoot: URL,
+        isoURL: URL,
+        expectedPar2Sets: Int
+    ) async throws -> [String] {
+        var summary: [String] = []
+
+        state.appendLog("Verify [staging]: SHA-256 of staged copy against the original-file manifest…")
+        let stagedCount = try await checkManifest(root: discRoot, level: "staging", state: state)
+        summary.append("Staging copy matches originals: PASSED (\(stagedCount) files, SHA-256)")
+
+        state.appendLog("Verify [ISO]: mounting ISO read-only…")
+        let mountPoint = try await attachISOReadOnly(isoURL)
+        do {
+            state.appendLog("Verify [ISO]: SHA-256 of every file inside the ISO…")
+            let isoCount = try await checkManifest(root: mountPoint, level: "ISO", state: state)
+            summary.append("ISO image contents: PASSED (\(isoCount) files, SHA-256)")
+            if settings.par2Enabled {
+                let sets = try await verifyPar2Sets(root: mountPoint, expected: expectedPar2Sets, level: "ISO", state: state)
+                summary.append("ISO PAR2 sets: PASSED (\(sets) set(s), par2 verify)")
+            }
+        } catch {
+            await detachImage(mountPoint)
+            throw error
+        }
+        await detachImage(mountPoint)
+
+        if settings.verifyMode == .deep && settings.burnAfterISO {
+            let discMount = try await locateBurnedMediaMountPoint(settings: settings, state: state)
+            let (_, info) = try await runner.runCollecting(
+                launchPath: ToolResolver.diskutilExecutable(),
+                arguments: ["info", discMount.path]
+            )
+            if !info.localizedCaseInsensitiveContains("optical") {
+                state.appendLog("WARNING: \(discMount.path) does not report as optical media; make sure this is the burned disc.")
+            }
+            state.appendLog("Verify [burned disc]: SHA-256 of every file on \(discMount.path)…")
+            let discCount = try await checkManifest(root: discMount, level: "burned disc", state: state)
+            summary.append("Burned disc contents: PASSED (\(discCount) files, SHA-256)")
+            if settings.par2Enabled {
+                let sets = try await verifyPar2Sets(root: discMount, expected: expectedPar2Sets, level: "burned disc", state: state)
+                summary.append("Burned disc PAR2 sets: PASSED (\(sets) set(s), par2 verify)")
+            }
+        } else if settings.burnAfterISO {
+            summary.append("Burned disc: NOT VERIFIED (choose Deep verify to check the disc)")
+        } else {
+            summary.append("Burned disc: NOT VERIFIED (burn disabled — ISO only)")
+        }
+        return summary
+    }
+
+    /// Checks `<root>/_BluArchive/SHA256SUMS.txt` against the files under `root`; returns the file count.
+    private func checkManifest(root: URL, level: String, state: BackupState) async throws -> Int {
+        let manifest = root
+            .appendingPathComponent(Self.archiveMetaFolderName, isDirectory: true)
+            .appendingPathComponent(Self.discManifestName)
+        guard FileManager.default.fileExists(atPath: manifest.path) else {
+            throw NSError(
+                domain: "BDXLBackup",
+                code: 37,
+                userInfo: [NSLocalizedDescriptionKey: "Verify [\(level)] failed: checksum manifest missing at \(manifest.path)"]
+            )
+        }
+        let log = Self.logger(for: state)
+        let result = try await Self.offMain {
+            try ChecksumManifest.verify(manifest: manifest, root: root, onProgress: { log("  checked \($0) files…") })
+        }
+        guard result.passed else {
+            let shown = result.failures.prefix(25).joined(separator: "\n")
+            let more = result.failures.count > 25 ? "\n… and \(result.failures.count - 25) more" : ""
+            throw NSError(
+                domain: "BDXLBackup",
+                code: 38,
+                userInfo: [NSLocalizedDescriptionKey: "Verify [\(level)] failed: \(result.failures.count) of \(result.checkedCount) file(s) differ:\n\(shown)\(more)"]
+            )
+        }
+        state.appendLog("Verify [\(level)]: SHA-256 OK for \(result.checkedCount) file(s).")
+        return result.checkedCount
+    }
+
+    /// Runs `par2 verify` for every set under `<root>/_BluArchive/par2`; returns the number of sets checked.
+    private func verifyPar2Sets(root: URL, expected: Int, level: String, state: BackupState) async throws -> Int {
+        guard let par2 = await ToolResolver.par2Executable() else {
+            throw NSError(domain: "BDXLBackup", code: 9, userInfo: [NSLocalizedDescriptionKey: "par2 disappeared from PATH."])
+        }
+        let par2Dir = root
+            .appendingPathComponent(Self.archiveMetaFolderName, isDirectory: true)
+            .appendingPathComponent("par2", isDirectory: true)
+        let sets = ((try? FileManager.default.contentsOfDirectory(at: par2Dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "par2" && !$0.lastPathComponent.contains(".vol") }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard sets.count == expected else {
+            throw NSError(
+                domain: "BDXLBackup",
+                code: 39,
+                userInfo: [NSLocalizedDescriptionKey: "Verify [\(level)] failed: expected \(expected) PAR2 set(s), found \(sets.count) in \(par2Dir.path)"]
+            )
+        }
+        for set in sets {
+            try Task.checkCancellation()
+            let args = ["verify", "-q", "-B\(root.path)", set.path]
+            let (code, out) = try await runner.runCollecting(launchPath: par2, arguments: args)
+            if code != 0 {
+                throw NSError(
+                    domain: "BDXLBackup",
+                    code: 40,
+                    userInfo: [NSLocalizedDescriptionKey: "Verify [\(level)] failed: par2 verify \(set.lastPathComponent) exited \(code):\n\(out.suffix(2000))"]
+                )
+            }
+        }
+        state.appendLog("Verify [\(level)]: par2 verify OK for \(sets.count) set(s).")
+        return sets.count
+    }
+
+    /// Mounts the ISO read-only at a private mount point (not under /Volumes, so it cannot be
+    /// mistaken for the burned disc).
+    private func attachISOReadOnly(_ isoURL: URL) async throws -> URL {
+        let mountPoint = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BluArchive-verify-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
+        let (code, out) = try await runner.runCollecting(
+            launchPath: ToolResolver.hdiutilExecutable(),
+            arguments: ["attach", "-readonly", "-nobrowse", "-noautoopen", "-noverify", "-mountpoint", mountPoint.path, isoURL.path]
+        )
+        if code != 0 {
+            try? FileManager.default.removeItem(at: mountPoint)
+            throw NSError(
+                domain: "BDXLBackup",
+                code: 41,
+                userInfo: [NSLocalizedDescriptionKey: "Verify [ISO] failed: could not mount ISO:\n\(out)"]
+            )
+        }
+        return mountPoint
+    }
+
+    private func detachImage(_ mountPoint: URL) async {
+        let hdiutil = ToolResolver.hdiutilExecutable()
+        if let (code, _) = try? await runner.runCollecting(launchPath: hdiutil, arguments: ["detach", mountPoint.path]), code == 0 {
+        } else {
+            _ = try? await runner.runCollecting(launchPath: hdiutil, arguments: ["detach", "-force", mountPoint.path])
+        }
+        // Only remove the mount point once it is an empty, unmounted directory.
+        if (try? FileManager.default.contentsOfDirectory(atPath: mountPoint.path))?.isEmpty == true {
+            try? FileManager.default.removeItem(at: mountPoint)
+        }
+    }
+
+    private func containsNonEmptyRegularFile(_ item: URL) -> Bool {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+        if let v = try? item.resourceValues(forKeys: Set(keys)), v.isRegularFile == true {
+            return (v.fileSize ?? 0) > 0
+        }
+        guard let e = FileManager.default.enumerator(at: item, includingPropertiesForKeys: keys) else {
+            return false
+        }
+        while let url = e.nextObject() as? URL {
+            if let v = try? url.resourceValues(forKeys: Set(keys)), v.isRegularFile == true, (v.fileSize ?? 0) > 0 {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func discReadme(settings: BackupJobSettings, sourceName: String, par2SetCount: Int) -> String {
+        let label = settings.volumeLabel
+        let created = ISO8601DateFormatter().string(from: Date())
+        let par2Section = settings.par2Enabled
+            ? """
+            par2/ — \(par2SetCount) PAR2 recovery set(s), one per top-level item, \(settings.par2RedundancyPercent)% redundancy.
+              File names inside each set are relative to the disc root (e.g. "1928/photo.jpg"), so pass -B:
+                par2 verify -B "/Volumes/\(label)" "/Volumes/\(label)/_BluArchive/par2/001_<name>.par2"
+              To repair: copy the damaged item AND _BluArchive/par2 to a writable disk, keeping the layout, then run
+                par2 repair -B "<copy root>" "<copy root>/_BluArchive/par2/<set>.par2"
+              Items that are empty or contain only 0-byte files have no PAR2 set (SHA-256 still covers them).
+            """
+            : "PAR2 was disabled for this disc."
+        return """
+        BluArchive disc — \(label)
+        Source folder: \(sourceName)
+        Created: \(created)
+
+        The disc root holds the original folder structure unchanged. This folder adds:
+
+        SHA256SUMS.txt — SHA-256 of every original file (paths relative to the disc root). Check with:
+          cd "/Volumes/\(label)" && shasum -a 256 -c _BluArchive/SHA256SUMS.txt
+
+        \(par2Section)
+
+        """
+    }
+
+    nonisolated private static func logger(for state: BackupState) -> @Sendable (String) -> Void {
+        { message in Task { @MainActor in state.appendLog(message) } }
+    }
+
+    /// Runs blocking file work (hashing) off the main actor; cancellation of the pipeline task propagates.
+    nonisolated private static func offMain<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask(operation: work)
+            return try await group.next()!
+        }
+    }
+
     private func topLevelItemsForPar2(in source: URL) throws -> [URL] {
         let fm = FileManager.default
         let entries = try fm.contentsOfDirectory(
@@ -495,6 +804,7 @@ final class BackupPipeline: ObservableObject {
             let name = entry.lastPathComponent
             if name.hasPrefix(".") { return false }
             if name == ".DS_Store" { return false }
+            if name == Self.archiveMetaFolderName { return false }
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: entry.path, isDirectory: &isDir) else {
                 return false

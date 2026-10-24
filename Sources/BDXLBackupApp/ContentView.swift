@@ -97,7 +97,7 @@ struct ContentView: View {
                                     step: 1
                                 )
                                 .disabled(!settings.par2Enabled)
-                                Text("With TAR off, PAR2 creates one set per top-level source item.")
+                                Text("With TAR off, PAR2 creates one set per top-level source item; the sets and a SHA-256 manifest are written to _BluArchive/ on the disc.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -172,7 +172,9 @@ struct ContentView: View {
                                         Text(v.rawValue).tag(v)
                                     }
                                 }
-                                Text("Quick verify checks staging TAR checksum; deep also checks burned media checksum.")
+                                Text(settings.tarFirstEnabled
+                                     ? "TAR on — quick: staging TAR checksum. Deep: also re-checks the TAR on the burned disc."
+                                     : "TAR off — quick: SHA-256 of every file in staging and inside the ISO, plus par2 verify of the ISO. Deep: also checks the burned disc.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             Toggle("Keep BluArchive staging folder (_bdxl_work)", isOn: $settings.keepStagingFiles)
@@ -297,9 +299,10 @@ struct ContentView: View {
     private var stagesTimeline: some View {
         HStack(spacing: 4) {
             ForEach(
-                [BackupStage.preflight, .tar, .par2, .sha256, .iso, .burn, .verify, .complete]
+                [BackupStage.preflight, .tar, .copy, .par2, .sha256, .iso, .burn, .verify, .complete]
                     .filter { stage in
                         if !settings.tarFirstEnabled && stage == .tar { return false }
+                        if settings.tarFirstEnabled && stage == .copy { return false }
                         if !settings.par2Enabled && stage == .par2 { return false }
                         if !settings.burnAfterISO && stage == .burn { return false }
                         if settings.verifyMode == .none && stage == .verify { return false }
@@ -324,7 +327,8 @@ struct ContentView: View {
                 """
                 BluArchive writes large working files and your final image here:
 
-                • _bdxl_work/ — staging folder (TAR, PAR2 pieces, checksum manifest when those options are on)
+                • _bdxl_work/ — staging folder (TAR, PAR2 pieces, checksum manifest when those options are on; \
+                with TAR off, a full copy of the source plus _BluArchive/ with SHA-256 manifest and PAR2 sets)
                 • Your volume name + .iso — the hybrid UDF/ISO you burn
 
                 Why not /tmp? macOS can wipe or pressure-clean temporary storage. \

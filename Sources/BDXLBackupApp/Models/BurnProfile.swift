@@ -68,8 +68,8 @@ enum BurnProfile: String, CaseIterable, Identifiable, Sendable {
 
 enum VerifyMode: String, CaseIterable, Identifiable, Sendable {
     case none = "None"
-    case quick = "Quick (staging TAR checksum)"
-    case deep = "Deep (burned media checksum + staging re-check)"
+    case quick = "Quick (staging + ISO checksums)"
+    case deep = "Deep (quick + burned disc checksums)"
 
     var id: String { rawValue }
 }
@@ -78,6 +78,7 @@ enum BackupStage: String, CaseIterable, Identifiable, Sendable, Hashable {
     case idle = "Idle"
     case preflight = "Preflight"
     case tar = "Create TAR"
+    case copy = "Copy to staging"
     case par2 = "PAR2 redundancy"
     case sha256 = "SHA256 manifest"
     case iso = "Build ISO"
