@@ -62,6 +62,7 @@ Open with **right-click → Open** the first time if Gatekeeper prompts.
 
 - Staging directory: `<output>/_bdxl_work` (removed after success unless **Keep staging** is on).
 - ISO path: `<output>/<volume label>.iso`
+- All work files (staging copy, PAR2 sets, manifests, ISO) are written only to the chosen output folder. SHA-256 hashing streams files in 4 MB chunks with constant memory (~10 MB); before 1.3 it kept every chunk alive until the run ended, so large archives pushed macOS into swap on the startup disk.
 - This app **orchestrates** system tools; it is not a custom disc encoding engine.
 
 ## License
