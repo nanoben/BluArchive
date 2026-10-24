@@ -174,7 +174,7 @@ struct ContentView: View {
                                 }
                                 Text(settings.tarFirstEnabled
                                      ? "TAR on — quick: staging TAR checksum. Deep: also re-checks the TAR on the burned disc."
-                                     : "TAR off — quick: SHA-256 of every file in staging and inside the ISO, plus par2 verify of the ISO. Deep: also checks the burned disc.")
+                                     : "TAR off — quick: SHA-256 of every file in staging and inside the ISO, plus par2 verify of the ISO, all before burning. Deep: also checks the burned disc.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             Toggle("Keep BluArchive staging folder (_bdxl_work)", isOn: $settings.keepStagingFiles)

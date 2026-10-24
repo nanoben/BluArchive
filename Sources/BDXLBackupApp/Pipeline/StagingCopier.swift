@@ -20,6 +20,7 @@ enum StagingCopier {
     static func copy(
         from source: URL,
         to destination: URL,
+        plan: DiscNamePlan,
         onProgress: (Result) -> Void = { _ in }
     ) throws -> Result {
         let fm = FileManager.default
@@ -37,7 +38,7 @@ enum StagingCopier {
                 return false
             }
             let from = sourceRoot + "/" + entry.relativePath
-            let to = destinationRoot + "/" + entry.relativePath
+            let to = destinationRoot + "/" + plan.discPath(for: entry.relativePath)
             switch entry.type {
             case .typeSymbolicLink?:
                 try fm.createSymbolicLink(atPath: to, withDestinationPath: try fm.destinationOfSymbolicLink(atPath: from))

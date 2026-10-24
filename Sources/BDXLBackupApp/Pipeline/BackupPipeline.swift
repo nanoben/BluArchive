@@ -29,6 +29,21 @@ final class BackupPipeline: ObservableObject {
             try await preflight(settings: settings, state: state)
             let paths = try await runTarPar2ShaIso(settings: settings, state: state)
 
+            var verificationSummary: [String] = []
+            // Non-TAR: staging and ISO are verified BEFORE burning, so a bad image is never burned.
+            if let discRoot = paths.discRootURL, settings.verifyMode != .none {
+                try Task.checkCancellation()
+                state.stage = .verify
+                state.progress = 0.75
+                verificationSummary += try await verifyNonTarBeforeBurn(
+                    settings: settings,
+                    state: state,
+                    discRoot: discRoot,
+                    isoURL: paths.isoURL,
+                    expectedPar2Sets: paths.par2SetCount
+                )
+            }
+
             if settings.burnAfterISO {
                 try Task.checkCancellation()
                 state.stage = .burn
@@ -43,17 +58,14 @@ final class BackupPipeline: ObservableObject {
                 state.appendLog("Skipping burn (generate ISO only).")
             }
 
-            var verificationSummary: [String] = []
             if settings.verifyMode != .none {
                 try Task.checkCancellation()
                 state.stage = .verify
                 state.progress = 0.92
-                if let discRoot = paths.discRootURL {
-                    verificationSummary = try await verifyNonTarArtifacts(
+                if paths.discRootURL != nil {
+                    verificationSummary += try await verifyNonTarBurnedDisc(
                         settings: settings,
                         state: state,
-                        discRoot: discRoot,
-                        isoURL: paths.isoURL,
                         expectedPar2Sets: paths.par2SetCount
                     )
                 } else {
@@ -248,6 +260,7 @@ final class BackupPipeline: ObservableObject {
         var isoSourceURL: URL
         /// Non-TAR only: staged copy of the source that becomes the disc root (originals + `_BluArchive/`).
         var discRootURL: URL?
+        var namePlan: DiscNamePlan?
         var par2SetCount = 0
 
         if settings.tarFirstEnabled {
@@ -271,11 +284,27 @@ final class BackupPipeline: ObservableObject {
             state.stage = .copy
             state.progress = 0.1
             let discRoot = workURL.appendingPathComponent("disc", isDirectory: true)
+            state.appendLog("Planning disc-safe names…")
+            let plan = try await Self.offMain { try DiscNamePlan.build(sourceRoot: source.path) }
+            if plan.renames.isEmpty {
+                state.appendLog("All \(plan.files.count + plan.directories.count) names can be stored on the disc unchanged.")
+            } else {
+                state.appendLog("\(plan.renames.count) item(s) get a disc-safe name (originals are not renamed; list in \(Self.archiveMetaFolderName)/RENAMED.txt):")
+                for r in plan.renames.prefix(50) {
+                    state.appendLog("  '\(r.originalPath)' → '\(r.discPath)'")
+                }
+                if plan.renames.count > 50 {
+                    state.appendLog("  … and \(plan.renames.count - 50) more")
+                }
+            }
+            try await probeDiscNames(plan, state: state)
+            namePlan = plan
+
             state.appendLog("Copying source into staging (originals are read-only): \(discRoot.path)")
             let copyStart = Date()
             let detail = Self.statusSetter(for: state)
             let copied = try await Self.offMain {
-                try StagingCopier.copy(from: source, to: discRoot, onProgress: { r in
+                try StagingCopier.copy(from: source, to: discRoot, plan: plan, onProgress: { r in
                     detail("Copying: \(r.files) files, \(Self.formatBytesStatic(r.bytes)) · \(Self.formatElapsed(since: copyStart))")
                 })
             }
@@ -449,14 +478,23 @@ final class BackupPipeline: ObservableObject {
         } else if let discRoot = discRootURL {
             state.appendLog("Writing per-file SHA-256 manifest from the ORIGINAL files…")
             let log = Self.logger(for: state)
+            let plan = namePlan ?? DiscNamePlan()
             let entries = try await Self.offMain {
-                try ChecksumManifest.build(root: source, onProgress: { log("  hashed \($0) original files…") })
+                try ChecksumManifest.build(
+                    root: source,
+                    pathMapper: { plan.discPath(for: $0) },
+                    onProgress: { log("  hashed \($0) original files…") }
+                )
             }
             let metaDir = discRoot.appendingPathComponent(Self.archiveMetaFolderName, isDirectory: true)
             let discManifestURL = metaDir.appendingPathComponent(Self.discManifestName)
             try ChecksumManifest.write(entries, to: discManifestURL)
-            try discReadme(settings: settings, sourceName: basename, par2SetCount: par2SetCount)
+            try discReadme(settings: settings, sourceName: basename, par2SetCount: par2SetCount, renameCount: plan.renames.count)
                 .write(to: metaDir.appendingPathComponent("README.txt"), atomically: true, encoding: .utf8)
+            if !plan.renames.isEmpty {
+                try plan.renameListText()
+                    .write(to: metaDir.appendingPathComponent("RENAMED.txt"), atomically: true, encoding: .utf8)
+            }
             state.appendLog("SHA-256 manifest: \(entries.count) file(s) → \(Self.archiveMetaFolderName)/\(Self.discManifestName)")
             effectiveManifestURL = discManifestURL
         }
@@ -676,9 +714,9 @@ final class BackupPipeline: ObservableObject {
         return entries.first { $0.lastPathComponent.hasPrefix(expectedVolumeLabel) }
     }
 
-    /// Non-TAR verification. Each level is reported separately; any failed check throws, and levels
-    /// that were not checked are reported as NOT VERIFIED rather than silently passing.
-    private func verifyNonTarArtifacts(
+    /// Non-TAR verification of staging and ISO, run before any burn. Each level is reported
+    /// separately; any failed check throws.
+    private func verifyNonTarBeforeBurn(
         settings: BackupJobSettings,
         state: BackupState,
         discRoot: URL,
@@ -706,7 +744,17 @@ final class BackupPipeline: ObservableObject {
             throw error
         }
         await detachImage(mountPoint)
+        return summary
+    }
 
+    /// Non-TAR check of the burned disc (Deep mode). Levels that were not checked are reported as
+    /// NOT VERIFIED rather than silently passing.
+    private func verifyNonTarBurnedDisc(
+        settings: BackupJobSettings,
+        state: BackupState,
+        expectedPar2Sets: Int
+    ) async throws -> [String] {
+        var summary: [String] = []
         if settings.verifyMode == .deep && settings.burnAfterISO {
             let discMount = try await locateBurnedMediaMountPoint(settings: settings, state: state)
             let (_, info) = try await runner.runCollecting(
@@ -795,6 +843,55 @@ final class BackupPipeline: ObservableObject {
         return sets.count
     }
 
+    /// Builds a tiny image with the planned names (empty files, on the internal temp disk), mounts it
+    /// and checks that every name reads back unchanged. Catches name rules beyond `DiscNamePlan`'s
+    /// before hours of copying/PAR2 work instead of at ISO verification.
+    private func probeDiscNames(_ plan: DiscNamePlan, state: BackupState) async throws {
+        state.appendLog("Checking all \(plan.files.count + plan.directories.count) disc names on a test image…")
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("BluArchive-nameprobe-\(UUID().uuidString)", isDirectory: true)
+        let tree = work.appendingPathComponent("tree", isDirectory: true)
+        let image = work.appendingPathComponent("probe.iso")
+        defer { try? fm.removeItem(at: work) }
+        try await Self.offMain {
+            let fm = FileManager.default
+            try fm.createDirectory(at: tree, withIntermediateDirectories: true)
+            for dir in plan.directories {
+                try fm.createDirectory(atPath: tree.path + "/" + dir, withIntermediateDirectories: true)
+            }
+            for file in plan.files {
+                guard fm.createFile(atPath: tree.path + "/" + file, contents: nil) else {
+                    throw NSError(domain: "BDXLBackup", code: 16, userInfo: [NSLocalizedDescriptionKey: "Name probe could not create: \(file)"])
+                }
+            }
+        }
+        let args = ["makehybrid", "-udf", "-iso", "-joliet", "-default-volume-name", "PROBE", "-o", image.path, tree.path]
+        let (code, out) = try await runner.runCollecting(launchPath: ToolResolver.hdiutilExecutable(), arguments: args)
+        guard code == 0 else {
+            throw NSError(domain: "BDXLBackup", code: 17, userInfo: [NSLocalizedDescriptionKey: "Name probe image failed:\n\(out)"])
+        }
+        let mount = try await attachISOReadOnly(image)
+        let missing: [String]
+        do {
+            missing = try await Self.offMain {
+                (plan.directories + plan.files).filter { !FileManager.default.fileExists(atPath: mount.path + "/" + $0) }
+            }
+        } catch {
+            await detachImage(mount)
+            throw error
+        }
+        await detachImage(mount)
+        guard missing.isEmpty else {
+            throw NSError(
+                domain: "BDXLBackup",
+                code: 18,
+                userInfo: [NSLocalizedDescriptionKey: "\(missing.count) name(s) would change on the disc; nothing was copied. Rename these in the source:\n"
+                    + missing.prefix(25).joined(separator: "\n")]
+            )
+        }
+        state.appendLog("Disc name check OK: every name reads back unchanged.")
+    }
+
     /// Mounts the ISO read-only at a private mount point (not under /Volumes, so it cannot be
     /// mistaken for the burned disc).
     private func attachISOReadOnly(_ isoURL: URL) async throws -> URL {
@@ -828,9 +925,12 @@ final class BackupPipeline: ObservableObject {
         }
     }
 
-    private func discReadme(settings: BackupJobSettings, sourceName: String, par2SetCount: Int) -> String {
+    private func discReadme(settings: BackupJobSettings, sourceName: String, par2SetCount: Int, renameCount: Int) -> String {
         let label = settings.volumeLabel
         let created = ISO8601DateFormatter().string(from: Date())
+        let renameLine = renameCount == 0
+            ? ""
+            : "\(renameCount) name(s) were changed so they survive on the disc (e.g. \":\" → \"-\"); see RENAMED.txt.\n"
         let par2Section = settings.par2Enabled
             ? """
             par2/ — \(par2SetCount) PAR2 recovery set(s), one per top-level item, \(settings.par2RedundancyPercent)% redundancy.
@@ -846,7 +946,7 @@ final class BackupPipeline: ObservableObject {
         Source folder: \(sourceName)
         Created: \(created)
 
-        The disc root holds the original folder structure unchanged. This folder adds:
+        The disc root holds the original folder structure. \(renameLine)This folder adds:
 
         SHA256SUMS.txt — SHA-256 of every original file (paths relative to the disc root). Check with:
           cd "/Volumes/\(label)" && shasum -a 256 -c _BluArchive/SHA256SUMS.txt

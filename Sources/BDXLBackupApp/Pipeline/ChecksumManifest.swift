@@ -26,6 +26,7 @@ enum ChecksumManifest {
     static func build(
         root: URL,
         excludingTopLevel excluded: Set<String> = [],
+        pathMapper: (String) -> String = { $0 },
         onProgress: (Int) -> Void = { _ in }
     ) throws -> [Entry] {
         let rootPath = root.path
@@ -37,7 +38,7 @@ enum ChecksumManifest {
             guard !item.isVolatileMetadata else { return false }
             if item.type == .typeRegular {
                 let url = URL(fileURLWithPath: rootPath + "/" + item.relativePath)
-                entries.append(Entry(relativePath: item.relativePath, sha256: try sha256Hex(of: url)))
+                entries.append(Entry(relativePath: pathMapper(item.relativePath), sha256: try sha256Hex(of: url)))
                 if entries.count % 500 == 0 { onProgress(entries.count) }
             }
             return true
