@@ -15,16 +15,29 @@ final class ProcessRunner: @unchecked Sendable {
     private let processQueue = DispatchQueue(label: "BDXLBackupApp.ProcessRunner")
     private var currentProcess: Process?
 
+    /// Grace period after SIGTERM before a cancelled child is force-killed.
+    static let killGraceSeconds: Double = 20
+
     nonisolated init() {}
 
+    /// SIGTERM the running child; SIGKILL only if it is still alive after `killGraceSeconds`.
     func cancel() {
-        processQueue.sync {
-            currentProcess?.terminate()
+        let process: Process? = processQueue.sync {
+            let p = currentProcess
             currentProcess = nil
+            return p
+        }
+        guard let process, process.isRunning else { return }
+        process.terminate()
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.killGraceSeconds) {
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
         }
     }
 
-    /// Runs process; invokes `onLine` on the main actor for each output line.
+    /// Runs process; invokes `onLine` on the main actor for each output line (split on "\n" and "\r",
+    /// so progress counters like "Processing: 42%\r" arrive as separate lines).
     @MainActor
     func runStreaming(
         launchPath: String,
@@ -33,11 +46,68 @@ final class ProcessRunner: @unchecked Sendable {
         environment: [String: String]? = nil,
         onLine: @escaping @MainActor (String) -> Void
     ) async throws -> Int32 {
+        var continuation: AsyncStream<[String]>.Continuation!
+        let batches = AsyncStream<[String]>(bufferingPolicy: .unbounded) { continuation = $0 }
+        let sink = continuation!
+
+        let outSplitter = LineSplitter()
+        let errSplitter = LineSplitter()
+        async let status = execute(
+            launchPath: launchPath,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            onStdout: { sink.yield(outSplitter.feed($0)) },
+            onStderr: { sink.yield(errSplitter.feed($0)) },
+            onFinish: {
+                sink.yield(outSplitter.flush() + errSplitter.flush())
+                sink.finish()
+            }
+        )
+        for await batch in batches {
+            batch.forEach(onLine)
+        }
+        return try await status
+    }
+
+    /// Non-streaming run (stdout + stderr combined, raw text).
+    func runCollecting(
+        launchPath: String,
+        arguments: [String],
+        currentDirectory: URL? = nil
+    ) async throws -> (exitCode: Int32, output: String) {
+        let collected = DataBox()
+        let code = try await execute(
+            launchPath: launchPath,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            environment: nil,
+            onStdout: { collected.append($0) },
+            onStderr: { collected.append($0) },
+            onFinish: {}
+        )
+        return (code, String(decoding: collected.data, as: UTF8.self))
+    }
+
+    /// Launches the process and drains both pipes from GCD `readabilityHandler`s.
+    ///
+    /// The pipes are always read as fast as the child writes, independent of the Swift concurrency
+    /// pool and of the consumer: a child (e.g. par2, which prints one line per source file) can never
+    /// block on a full 64 KiB pipe buffer. Blocking reads on the cooperative pool caused exactly that
+    /// deadlock before (par2 stuck in write() while its other threads spin at 100% CPU).
+    private func execute(
+        launchPath: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String]?,
+        onStdout: @escaping @Sendable (Data) -> Void,
+        onStderr: @escaping @Sendable (Data) -> Void,
+        onFinish: @escaping @Sendable () -> Void
+    ) async throws -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = arguments
         process.currentDirectoryURL = currentDirectory
-
         if let environment {
             var env = ProcessInfo.processInfo.environment
             for (k, v) in environment {
@@ -52,79 +122,107 @@ final class ProcessRunner: @unchecked Sendable {
         process.standardError = errPipe
         process.standardInput = FileHandle.nullDevice
 
+        let drained = DispatchGroup()
+        for (pipe, handler) in [(outPipe, onStdout), (errPipe, onStderr)] {
+            drained.enter()
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    drained.leave()
+                } else {
+                    handler(data)
+                }
+            }
+        }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int32, Error>) in
+                process.terminationHandler = { finished in
+                    // Wait for EOF on both pipes so no trailing output is lost; bounded in case a
+                    // grandchild keeps a pipe open.
+                    DispatchQueue.global().async {
+                        _ = drained.wait(timeout: .now() + 10)
+                        self.unregister(finished)
+                        onFinish()
+                        cont.resume(returning: finished.terminationStatus)
+                    }
+                }
+                processQueue.sync { currentProcess = process }
+                do {
+                    try process.run()
+                } catch {
+                    outPipe.fileHandleForReading.readabilityHandler = nil
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    unregister(process)
+                    onFinish()
+                    cont.resume(throwing: error)
+                }
+            }
+        } onCancel: {
+            self.cancel()
+        }
+    }
+
+    private func unregister(_ process: Process) {
         processQueue.sync {
-            currentProcess = process
-        }
-
-        defer {
-            processQueue.sync {
-                if currentProcess === process {
-                    currentProcess = nil
-                }
+            if currentProcess === process {
+                currentProcess = nil
             }
         }
+    }
+}
 
-        try process.run()
+/// Splits a byte stream into lines on "\n", "\r" or "\r\n"; thread-safe.
+private final class LineSplitter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = Data()
 
-        let outHandle = outPipe.fileHandleForReading
-        let errHandle = errPipe.fileHandleForReading
-
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { @MainActor in
-                do {
-                    try await Self.consumeLines(from: outHandle, onLine: onLine)
-                } catch {
-                    onLine("[stdout read error] \(error.localizedDescription)")
+    func feed(_ data: Data) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        pending.append(data)
+        var lines: [String] = []
+        var start = pending.startIndex
+        var i = start
+        while i < pending.endIndex {
+            let byte = pending[i]
+            if byte == 0x0A || byte == 0x0D {
+                lines.append(String(decoding: pending[start..<i], as: UTF8.self))
+                if byte == 0x0D, pending.index(after: i) < pending.endIndex, pending[pending.index(after: i)] == 0x0A {
+                    i = pending.index(after: i)
                 }
+                start = pending.index(after: i)
             }
-            group.addTask { @MainActor in
-                do {
-                    try await Self.consumeLines(from: errHandle, onLine: onLine)
-                } catch {
-                    onLine("[stderr read error] \(error.localizedDescription)")
-                }
-            }
-            group.addTask {
-                process.waitUntilExit()
-            }
+            i = pending.index(after: i)
         }
-
-        return process.terminationStatus
+        pending = Data(pending[start...])
+        return lines.filter { !$0.isEmpty }
     }
 
-    /// Non-streaming run (tests / small output).
-    func runCollecting(
-        launchPath: String,
-        arguments: [String],
-        currentDirectory: URL? = nil
-    ) async throws -> (exitCode: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: launchPath)
-        process.arguments = arguments
-        process.currentDirectoryURL = currentDirectory
+    func flush() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        let rest = String(decoding: pending, as: UTF8.self)
+        pending = Data()
+        return rest.isEmpty ? [] : [rest]
+    }
+}
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        process.standardInput = FileHandle.nullDevice
+private final class DataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = Data()
 
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let text = String(decoding: data, as: UTF8.self)
-        return (process.terminationStatus, text)
+    func append(_ data: Data) {
+        lock.lock()
+        storage.append(data)
+        lock.unlock()
     }
 
-    @MainActor
-    private static func consumeLines(
-        from handle: FileHandle,
-        onLine: @escaping @MainActor (String) -> Void
-    ) async throws {
-        for try await rawLine in handle.bytes.lines {
-            if Task.isCancelled { break }
-            let line = String(rawLine)
-            onLine(line)
-        }
+    var data: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }
 
@@ -184,10 +282,6 @@ enum ToolResolver {
             preferred: ["/usr/bin/hdiutil", "/usr/sbin/hdiutil"],
             defaultPath: "/usr/bin/hdiutil"
         )
-    }
-
-    static func dittoExecutable() -> String {
-        "/usr/bin/ditto"
     }
 
     static func drutilExecutable() -> String {

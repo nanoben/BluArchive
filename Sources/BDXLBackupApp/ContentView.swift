@@ -183,6 +183,11 @@ struct ContentView: View {
                             Section("Actions") {
                                 stagesTimeline
                                 ProgressView(value: state.progress)
+                                if !state.statusDetail.isEmpty {
+                                    Text(state.statusDetail)
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
                                 HStack {
                                     Button(state.isRunning ? "Running…" : "Run backup") {
                                         startRun()

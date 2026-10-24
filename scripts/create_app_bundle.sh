@@ -26,6 +26,8 @@ fi
 APP_NAME="${APP_NAME:-BluArchive}"
 OUT_DIR="${OUT_DIR:-$ROOT/build}"
 BUNDLE_ID="${BUNDLE_ID:-local.bdxl.BDXLBackupApp}"
+APP_VERSION="${APP_VERSION:-1.0}"
+BUILD_NUMBER="${BUILD_NUMBER:-1}"
 BUNDLE="$OUT_DIR/${APP_NAME}.app"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS"
@@ -80,9 +82,9 @@ cat > "$PLIST" <<EOF
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0</string>
+  <string>${APP_VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>${BUILD_NUMBER}</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.3</string>
   <key>NSHighResolutionCapable</key>

@@ -18,6 +18,7 @@ final class BackupPipeline: ObservableObject {
 
         defer {
             state.isRunning = false
+            state.statusDetail = ""
             if state.stage != .complete && state.stage != .failed {
                 state.stage = .failed
             }
@@ -91,8 +92,14 @@ final class BackupPipeline: ObservableObject {
             state.appendLog("Cancelled.")
         } catch {
             state.stage = .failed
-            state.lastErrorMessage = error.localizedDescription
-            state.appendLog("ERROR: \(error.localizedDescription)")
+            if Task.isCancelled {
+                // A cancelled child (e.g. par2 after SIGTERM) surfaces as a non-zero exit; report the cause.
+                state.lastErrorMessage = "Cancelled."
+                state.appendLog("Cancelled (\(error.localizedDescription)).")
+            } else {
+                state.lastErrorMessage = error.localizedDescription
+                state.appendLog("ERROR: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -265,13 +272,21 @@ final class BackupPipeline: ObservableObject {
             state.progress = 0.1
             let discRoot = workURL.appendingPathComponent("disc", isDirectory: true)
             state.appendLog("Copying source into staging (originals are read-only): \(discRoot.path)")
-            let dittoArgs = ["--norsrc", "--noextattr", "--noqtn", "--noacl", source.path, discRoot.path]
-            let dittoCode = try await runner.runStreaming(
-                launchPath: ToolResolver.dittoExecutable(),
-                arguments: dittoArgs,
-                onLine: { state.appendLog($0) }
+            let copyStart = Date()
+            let detail = Self.statusSetter(for: state)
+            let copied = try await Self.offMain {
+                try StagingCopier.copy(from: source, to: discRoot, onProgress: { r in
+                    detail("Copying: \(r.files) files, \(Self.formatBytesStatic(r.bytes)) · \(Self.formatElapsed(since: copyStart))")
+                })
+            }
+            state.appendLog(
+                "Staging copy done in \(Self.formatElapsed(since: copyStart)): \(copied.files) files, "
+                    + "\(formatBytes(copied.bytes)), \(copied.directories) folders"
+                    + (copied.symlinks > 0 ? ", \(copied.symlinks) symlinks" : "") + "."
             )
-            try throwIfBadExit(dittoCode, cmd: "ditto \(dittoArgs.joined(separator: " "))")
+            if copied.skippedMetadata > 0 {
+                state.appendLog("Left out \(copied.skippedMetadata) Finder metadata file(s) (.DS_Store / ._* AppleDouble sidecars); file contents and dates are copied unchanged.")
+            }
             try FileManager.default.createDirectory(
                 at: discRoot.appendingPathComponent(Self.archiveMetaFolderName, isDirectory: true),
                 withIntermediateDirectories: true
@@ -315,28 +330,103 @@ final class BackupPipeline: ObservableObject {
                 state.appendLog("PAR2 non-TAR mode: \(items.count) top-level item(s), \(redundancy)% redundancy.")
             }
 
+            let listDir = workURL.appendingPathComponent("par2-lists", isDirectory: true)
+            try FileManager.default.createDirectory(at: listDir, withIntermediateDirectories: true)
+
+            // Plan every set up front, so an impossible set fails before hours of work.
+            var jobs: [(index: Int, item: URL, plan: Par2Planner.Plan, list: URL)] = []
             for (index, item) in items.enumerated() {
-                try Task.checkCancellation()
                 // par2 rejects folders that hold no data ("You must specify a list of files"); such items
                 // are still on the disc and covered by the SHA-256 manifest.
-                guard containsNonEmptyRegularFile(item) else {
-                    state.appendLog("PAR2 skip for '\(item.lastPathComponent)': no non-empty files (covered by SHA-256 manifest only).")
-                    continue
+                let files = try Par2Planner.sourceFiles(underPath: discRoot.path + "/" + item.lastPathComponent)
+                if let odd = files.first(where: { $0.path.contains("\n") || $0.path.contains("\r") }) {
+                    throw NSError(
+                        domain: "BDXLBackup",
+                        code: 15,
+                        userInfo: [NSLocalizedDescriptionKey: "PAR2 file lists cannot hold a name with a line break: \(odd.path)"]
+                    )
                 }
-                let baseName = par2BaseName(for: item, index: index)
+                do {
+                    guard let plan = try Par2Planner.plan(fileSizes: files.map(\.size), redundancyPercent: redundancy) else {
+                        state.appendLog("PAR2 skip for '\(item.lastPathComponent)': no non-empty files (covered by SHA-256 manifest only).")
+                        continue
+                    }
+                    let list = listDir.appendingPathComponent(par2BaseName(for: item, index: index) + ".txt")
+                    try (files.map(\.path).joined(separator: "\n") + "\n")
+                        .write(to: list, atomically: true, encoding: .utf8)
+                    jobs.append((index, item, plan, list))
+                } catch {
+                    throw NSError(
+                        domain: "BDXLBackup",
+                        code: 14,
+                        userInfo: [NSLocalizedDescriptionKey: "PAR2 cannot protect '\(item.lastPathComponent)' as one set: \(error.localizedDescription) Split it into subfolders."]
+                    )
+                }
+            }
+
+            let par2Start = Date()
+            for (number, job) in jobs.enumerated() {
+                try Task.checkCancellation()
+                let name = job.item.lastPathComponent
+                let plan = job.plan
+                let label = "PAR2 set \(number + 1) of \(jobs.count): '\(name)'"
+                let baseName = par2BaseName(for: job.item, index: job.index)
                 let par2BasePath = par2OutputDir.appendingPathComponent(baseName).path
-                // -R: recurse into folders. -B: store paths relative to the disc root, e.g. "1928/x.jpg",
-                // so the set verifies against the original folder structure on the disc.
-                let args = ["create", "-q", "-R", "-r\(redundancy)", "-B\(discRoot.path)", par2BasePath, item.path]
-                state.appendLog("PAR2 create for '\(item.lastPathComponent)'…")
+                // @list: the item's files, gathered recursively by Par2Planner.sourceFiles (replaces -R,
+                // which would also pick up exFAT `._` sidecars). -B: store paths relative to the disc root,
+                // e.g. "1928/x.jpg", so the set verifies against the original folder structure on the disc.
+                // -s: explicit block size from Par2Planner. No -q: par2's block summary and
+                // "Processing: n%" lines drive the progress display (per-file lines are only counted).
+                let args = [
+                    "create", "-r\(redundancy)", "-s\(plan.blockSize)",
+                    "-B\(discRoot.path)", par2BasePath, "@\(job.list.path)"
+                ]
+                state.appendLog(
+                    "\(label) — \(plan.fileCount) files, \(formatBytes(plan.totalBytes)), "
+                        + "block size \(Par2Planner.formatBlockSize(plan.blockSize)), "
+                        + "~\(plan.sourceBlocks) source / ~\(plan.recoveryBlocks) recovery blocks"
+                )
+
+                let setStart = Date()
+                let progress = SetProgress()
+                let setCount = Double(jobs.count)
+                func show(_ fraction: Double) {
+                    state.progress = 0.35 + 0.2 * (Double(number) + fraction) / setCount
+                    state.statusDetail = "\(label) · \(progress.phase) · \(Self.formatElapsed(since: setStart))"
+                }
+                show(0)
+                let heartbeat = Task { @MainActor in
+                    while true {
+                        try await Task.sleep(nanoseconds: 60_000_000_000)
+                        state.appendLog("  … \(label) still running (\(progress.phase), \(Self.formatElapsed(since: setStart)))")
+                    }
+                }
+                defer { heartbeat.cancel() }
+
                 let code = try await runner.runStreaming(
                     launchPath: par2,
                     arguments: args,
-                    onLine: { state.appendLog($0) }
+                    onLine: { line in
+                        if line.hasPrefix("Opening:") || line.hasPrefix("Loading:") {
+                            progress.opened += 1
+                            progress.phase = "reading files \(progress.opened)/\(plan.fileCount)"
+                            show(0.05 * Double(progress.opened) / Double(max(1, plan.fileCount)))
+                        } else if let pct = Self.percent(in: line, after: "Processing:") {
+                            progress.phase = String(format: "computing %.1f%%", pct)
+                            show(0.05 + 0.95 * pct / 100)
+                        } else if line.hasPrefix("Constructing:") {
+                            progress.phase = "preparing matrix"
+                        } else {
+                            state.appendLog("  \(line)")
+                        }
+                    }
                 )
+                heartbeat.cancel()
                 try throwIfBadExit(code, cmd: "par2 \(args.joined(separator: " "))")
                 par2SetCount += 1
+                state.appendLog("\(label) done in \(Self.formatElapsed(since: setStart)) (total PAR2 time \(Self.formatElapsed(since: par2Start))).")
             }
+            state.statusDetail = ""
             state.appendLog("PAR2 non-TAR mode: \(par2SetCount) set(s) written to \(Self.archiveMetaFolderName)/par2 on the disc.")
         } else {
             state.appendLog("Skipping PAR2 stage (disabled).")
@@ -680,6 +770,7 @@ final class BackupPipeline: ObservableObject {
             .appendingPathComponent("par2", isDirectory: true)
         let sets = ((try? FileManager.default.contentsOfDirectory(at: par2Dir, includingPropertiesForKeys: nil)) ?? [])
             .filter { $0.pathExtension == "par2" && !$0.lastPathComponent.contains(".vol") }
+            .filter { !ChecksumManifest.isVolatileMetadata($0.lastPathComponent) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         guard sets.count == expected else {
             throw NSError(
@@ -737,22 +828,6 @@ final class BackupPipeline: ObservableObject {
         }
     }
 
-    private func containsNonEmptyRegularFile(_ item: URL) -> Bool {
-        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
-        if let v = try? item.resourceValues(forKeys: Set(keys)), v.isRegularFile == true {
-            return (v.fileSize ?? 0) > 0
-        }
-        guard let e = FileManager.default.enumerator(at: item, includingPropertiesForKeys: keys) else {
-            return false
-        }
-        while let url = e.nextObject() as? URL {
-            if let v = try? url.resourceValues(forKeys: Set(keys)), v.isRegularFile == true, (v.fileSize ?? 0) > 0 {
-                return true
-            }
-        }
-        return false
-    }
-
     private func discReadme(settings: BackupJobSettings, sourceName: String, par2SetCount: Int) -> String {
         let label = settings.volumeLabel
         let created = ISO8601DateFormatter().string(from: Date())
@@ -791,6 +866,37 @@ final class BackupPipeline: ObservableObject {
             group.addTask(operation: work)
             return try await group.next()!
         }
+    }
+
+    /// Live state of one `par2 create`, shared by its output handler and the heartbeat task.
+    @MainActor
+    private final class SetProgress {
+        var phase = "opening files"
+        var opened = 0
+    }
+
+    nonisolated private static func statusSetter(for state: BackupState) -> @Sendable (String) -> Void {
+        { text in Task { @MainActor in state.statusDetail = text } }
+    }
+
+    /// Parses "Processing: 42.5%" style par2 progress lines.
+    nonisolated static func percent(in line: String, after prefix: String) -> Double? {
+        guard line.hasPrefix(prefix) else { return nil }
+        let rest = line.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+        guard rest.hasSuffix("%") else { return nil }
+        return Double(rest.dropLast())
+    }
+
+    nonisolated static func formatElapsed(since start: Date) -> String {
+        let s = Int(Date().timeIntervalSince(start))
+        return s >= 3600
+            ? String(format: "%dh %02dm %02ds", s / 3600, s / 60 % 60, s % 60)
+            : String(format: "%dm %02ds", s / 60, s % 60)
+    }
+
+    nonisolated static func formatBytesStatic(_ b: Int64) -> String {
+        let mb = Double(b) / (1024 * 1024)
+        return mb > 1000 ? String(format: "%.2f GiB", mb / 1024) : String(format: "%.1f MiB", mb)
     }
 
     private func topLevelItemsForPar2(in source: URL) throws -> [URL] {
@@ -861,10 +967,6 @@ final class BackupPipeline: ObservableObject {
     }
 
     private func formatBytes(_ b: Int64) -> String {
-        let mb = Double(b) / (1024 * 1024)
-        if mb > 1000 {
-            return String(format: "%.2f GiB", mb / 1024)
-        }
-        return String(format: "%.1f MiB", mb)
+        Self.formatBytesStatic(b)
     }
 }

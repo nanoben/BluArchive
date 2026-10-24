@@ -21,34 +21,26 @@ enum ChecksumManifest {
         name == ".DS_Store" || name.hasPrefix("._")
     }
 
-    /// Hashes every regular file below `root` (read-only access). Symlinks are not followed.
+    /// Hashes every regular file below `root` (read-only access). Symlinks are not followed;
+    /// an unreadable folder throws instead of producing a silently incomplete manifest.
     static func build(
         root: URL,
         excludingTopLevel excluded: Set<String> = [],
         onProgress: (Int) -> Void = { _ in }
     ) throws -> [Entry] {
-        let rootPath = root.standardizedFileURL.path
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
-            options: [],
-            errorHandler: { _, _ in false }
-        ) else {
-            throw NSError(domain: "BDXLBackup", code: 60, userInfo: [NSLocalizedDescriptionKey: "Cannot enumerate \(rootPath)"])
-        }
-
+        let rootPath = root.path
         var entries: [Entry] = []
-        while let url = enumerator.nextObject() as? URL {
-            try Task.checkCancellation()
-            let rel = relativePath(of: url, under: rootPath)
-            if enumerator.level == 1, excluded.contains(url.lastPathComponent) {
-                enumerator.skipDescendants()
-                continue
+        try FileWalker.walk(root: rootPath) { item in
+            if !item.relativePath.contains("/"), excluded.contains(item.name) {
+                return false
             }
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey])
-            guard values.isRegularFile == true, !isVolatileMetadata(url.lastPathComponent) else { continue }
-            entries.append(Entry(relativePath: rel, sha256: try sha256Hex(of: url)))
-            if entries.count % 500 == 0 { onProgress(entries.count) }
+            guard !item.isVolatileMetadata else { return false }
+            if item.type == .typeRegular {
+                let url = URL(fileURLWithPath: rootPath + "/" + item.relativePath)
+                entries.append(Entry(relativePath: item.relativePath, sha256: try sha256Hex(of: url)))
+                if entries.count % 500 == 0 { onProgress(entries.count) }
+            }
+            return true
         }
         return entries.sorted { $0.relativePath < $1.relativePath }
     }
@@ -94,12 +86,6 @@ enum ChecksumManifest {
             hasher.update(data: chunk)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func relativePath(of url: URL, under rootPath: String) -> String {
-        let full = url.standardizedFileURL.path
-        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-        return full.hasPrefix(prefix) ? String(full.dropFirst(prefix.count)) : url.lastPathComponent
     }
 
     /// shasum/GNU convention: names containing a backslash or newline are escaped and the line gets a leading "\".

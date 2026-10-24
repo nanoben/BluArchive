@@ -9,6 +9,8 @@ final class BackupState: ObservableObject {
     @Published var logLines: [String] = []
     @Published var isRunning: Bool = false
     @Published var lastErrorMessage: String?
+    /// One-line live status of the current long-running step (set, phase, elapsed time).
+    @Published var statusDetail: String = ""
 
     func appendLog(_ line: String) {
         let stamp = ISO8601DateFormatter().string(from: Date())
@@ -23,6 +25,7 @@ final class BackupState: ObservableObject {
         stage = .idle
         progress = 0
         lastErrorMessage = nil
+        statusDetail = ""
         isRunning = false
         clearLog()
     }
